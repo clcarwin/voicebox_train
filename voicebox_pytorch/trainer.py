@@ -18,6 +18,9 @@ from voicebox_pytorch.optimizer import get_optimizer
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import DistributedDataParallelKwargs
 
+from tqdm import tqdm
+import os
+
 # helpers
 
 def exists(val):
@@ -64,7 +67,8 @@ class VoiceBoxTrainer(nn.Module):
         cfm_wrapper: ConditionalFlowMatcherWrapper,
         *,
         batch_size,
-        dataset: Dataset,
+        dataset_train: Dataset,
+        dataset_val: Dataset,
         num_train_steps = None,
         num_warmup_steps = None,
         num_epochs = None,
@@ -82,9 +86,14 @@ class VoiceBoxTrainer(nn.Module):
         force_clear_prev_results = None,
         split_batches = False,
         drop_last = False,
+        num_workers = 0,
+        keep_save_count = 0, # 0 is keep all saved model
         accelerate_kwargs: dict = dict(),
     ):
         super().__init__()
+
+        self.keep_save_count = keep_save_count
+        self.savepathlist = []
 
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters = True)
 
@@ -119,18 +128,18 @@ class VoiceBoxTrainer(nn.Module):
 
         # create dataset
 
-        self.ds = dataset
+        self.ds = dataset_train
+        self.valid_ds = dataset_val
 
-        # split for validation
-
-        if valid_frac > 0:
-            train_size = int((1 - valid_frac) * len(self.ds))
-            valid_size = len(self.ds) - train_size
-            self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
-            self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
-        else:
-            self.valid_ds = self.ds
-            self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
+        # # split for validation
+        # if valid_frac > 0:
+        #     train_size = int((1 - valid_frac) * len(self.ds))
+        #     valid_size = len(self.ds) - train_size
+        #     self.ds, self.valid_ds = random_split(self.ds, [train_size, valid_size], generator = torch.Generator().manual_seed(random_split_seed))
+        #     self.print(f'training with dataset of {len(self.ds)} samples and validating with randomly splitted {len(self.valid_ds)} samples')
+        # else:
+        #     self.valid_ds = self.ds
+        #     self.print(f'training with shared training and valid dataset of {len(self.ds)} samples')
 
         assert len(self.ds) >= batch_size, 'dataset must have sufficient samples for training'
         assert len(self.valid_ds) >= batch_size, f'validation dataset must have sufficient number of samples (currently {len(self.valid_ds)}) for training'
@@ -146,8 +155,8 @@ class VoiceBoxTrainer(nn.Module):
         
         # dataloader
 
-        self.dl = get_dataloader(self.ds, batch_size = batch_size, shuffle = True, drop_last = drop_last)
-        self.valid_dl = get_dataloader(self.valid_ds, batch_size = batch_size, shuffle = True, drop_last = drop_last)
+        self.dl = get_dataloader(self.ds, batch_size = batch_size, shuffle = True, drop_last = drop_last, num_workers=num_workers)
+        self.valid_dl = get_dataloader(self.valid_ds, batch_size = 1, shuffle = True, drop_last = drop_last, num_workers=2)
 
         # prepare with accelerator
 
@@ -174,8 +183,8 @@ class VoiceBoxTrainer(nn.Module):
 
         self.results_folder = Path(results_folder)
 
-        if self.is_main and force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
-            rmtree(str(self.results_folder))
+        # if self.is_main and force_clear_prev_results is True or (not exists(force_clear_prev_results) and len([*self.results_folder.glob('**/*')]) > 0 and yes_or_no('do you want to clear previous experiment checkpoints and results?')):
+        #     rmtree(str(self.results_folder))
 
         self.results_folder.mkdir(parents = True, exist_ok = True)
         
@@ -189,22 +198,23 @@ class VoiceBoxTrainer(nn.Module):
         self.accelerator.init_trackers("voicebox", config=hps)
 
     def save(self, path):
-        pkg = dict(
-            model = self.accelerator.get_state_dict(self.cfm_wrapper),
-            optim = self.optim.state_dict(),
-            scheduler = self.scheduler.state_dict()
-        )
-        torch.save(pkg, path)
+        # pkg = dict(
+        #     model = self.accelerator.get_state_dict(self.cfm_wrapper),
+        #     optim = self.optim.state_dict(),
+        #     scheduler = self.scheduler.state_dict()
+        # )
+        # torch.save(pkg, path)
+        torch.save(self.accelerator.get_state_dict(self.cfm_wrapper), path)
 
-    def load(self, path):
-        cfm_wrapper = self.accelerator.unwrap_model(self.cfm_wrapper)
-        pkg = cfm_wrapper.load(path)
+    # def load(self, path):
+    #     cfm_wrapper = self.accelerator.unwrap_model(self.cfm_wrapper)
+    #     pkg = cfm_wrapper.load(path)
 
-        self.optim.load_state_dict(pkg['optim'])
-        self.scheduler.load_state_dict(pkg['scheduler'])
+    #     self.optim.load_state_dict(pkg['optim'])
+    #     self.scheduler.load_state_dict(pkg['scheduler'])
 
-        # + 1 to start from the next step and avoid overwriting the last checkpoint
-        self.steps = torch.tensor([checkpoint_num_steps(path) + 1], device=self.device)
+    #     # + 1 to start from the next step and avoid overwriting the last checkpoint
+    #     self.steps = torch.tensor([checkpoint_num_steps(path) + 1], device=self.device)
 
     def print(self, msg):
         self.accelerator.print(msg)
@@ -279,8 +289,8 @@ class VoiceBoxTrainer(nn.Module):
 
         # log
 
-        if not steps % self.log_every:
-            self.print(f"{steps}: loss: {logs['loss']:0.3f}")
+        # if not steps % self.log_every:
+        #     self.print(f"{steps}: loss: {logs['loss']:0.3f}")
 
         self.accelerator.log({"train_loss": logs['loss']}, step=steps)
 
@@ -304,8 +314,15 @@ class VoiceBoxTrainer(nn.Module):
         # save model every so often
 
         if self.is_main and not (steps % self.save_model_every):
-            model_path = str(self.results_folder / f'voicebox.{steps}.pt')
+            model_path = str(self.results_folder / f'voicebox.{steps:08d}.pt')
             self.save(model_path)
+
+            self.savepathlist.append(model_path)
+            if self.keep_save_count>0:
+                if len(self.savepathlist)>self.keep_save_count:
+                    os.remove(self.savepathlist[0])
+                    self.savepathlist = self.savepathlist[1:] # remove first path
+
 
             self.print(f'{steps}: saving model to {str(self.results_folder)}')
 
@@ -313,9 +330,11 @@ class VoiceBoxTrainer(nn.Module):
         return logs
 
     def train(self, log_fn = noop):
-        while self.steps < self.num_train_steps:
+        # while self.steps < self.num_train_steps:
+        for _ in (pbar := tqdm(range(self.num_train_steps), disable=(not self.is_main))):
             logs = self.train_step()
             log_fn(logs)
+            pbar.set_description(f"loss:{logs['loss']:0.3f}")
 
         self.print('training complete')
         self.accelerator.end_training()

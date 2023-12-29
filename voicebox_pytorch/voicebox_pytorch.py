@@ -21,12 +21,12 @@ from einops import rearrange, repeat, reduce, pack, unpack
 
 from voicebox_pytorch.attend import Attend
 
-from naturalspeech2_pytorch.aligner import Aligner, ForwardSumLoss, BinLoss, maximum_path
-from naturalspeech2_pytorch.utils.tokenizer import Tokenizer
-from naturalspeech2_pytorch.naturalspeech2_pytorch import generate_mask_from_repeats
+# from naturalspeech2_pytorch.aligner import Aligner, ForwardSumLoss, BinLoss, maximum_path
+# from naturalspeech2_pytorch.utils.tokenizer import Tokenizer
+# from naturalspeech2_pytorch.naturalspeech2_pytorch import generate_mask_from_repeats
 
 from audiolm_pytorch import EncodecWrapper
-from spear_tts_pytorch import TextToSemantic
+# from spear_tts_pytorch import TextToSemantic
 
 from gateloop_transformer import SimpleGateLoopLayer as GateLoop
 
@@ -553,7 +553,7 @@ class EncodecVoco(AudioEncoderDecoder):
         self,
         *,
         sampling_rate = 24000,
-        pretrained_vocos_path = 'charactr/vocos-encodec-24khz',
+        pretrained_vocos_path = './checkpoints/vocos-encodec-24khz',
         bandwidth_id = 2
     ):
         super().__init__()
@@ -592,288 +592,6 @@ class EncodecVoco(AudioEncoderDecoder):
         return torch.stack(all_audios)
 
 # both duration and main denoising model are transformers
-
-class DurationPredictor(Module):
-    @beartype
-    def __init__(
-        self,
-        *,
-        audio_enc_dec: Optional[AudioEncoderDecoder] = None,
-        tokenizer: Optional[Tokenizer] = None,
-        num_phoneme_tokens: Optional[int] = None,
-        dim_phoneme_emb = 512,
-        dim = 512,
-        depth = 10,
-        dim_head = 64,
-        heads = 8,
-        ff_mult = 4,
-        ff_dropout = 0.,
-        conv_pos_embed_kernel_size = 31,
-        conv_pos_embed_groups = None,
-        attn_dropout = 0,
-        attn_flash = False,
-        attn_qk_norm = True,
-        use_gateloop_layers = False,
-        p_drop_prob = 0.2, # p_drop in paper
-        frac_lengths_mask: Tuple[float, float] = (0.1, 1.),
-        aligner_kwargs: dict = dict(dim_in = 80, attn_channels = 80)
-    ):
-        super().__init__()
-
-        # audio encoder / decoder
-
-        self.audio_enc_dec = audio_enc_dec
-
-        if exists(audio_enc_dec) and dim != audio_enc_dec.latent_dim:
-            self.proj_in = nn.Linear(audio_enc_dec.latent_dim, dim)
-        else:
-            self.proj_in = nn.Identity()
-
-        # phoneme related
-
-        assert not (exists(tokenizer) and exists(num_phoneme_tokens)), 'if a phoneme tokenizer was passed into duration module, number of phoneme tokens does not need to be specified'
-
-        if not exists(tokenizer) and not exists(num_phoneme_tokens):
-            tokenizer = Tokenizer() # default to english phonemes with espeak
-
-        if exists(tokenizer):
-            num_phoneme_tokens = tokenizer.vocab_size
-
-        self.tokenizer = tokenizer
-
-        self.to_phoneme_emb = nn.Embedding(num_phoneme_tokens, dim_phoneme_emb)
-
-        self.p_drop_prob = p_drop_prob
-        self.frac_lengths_mask = frac_lengths_mask
-
-        self.to_embed = nn.Linear(dim + dim_phoneme_emb, dim)
-
-        self.null_cond = nn.Parameter(torch.zeros(dim), requires_grad = False)
-
-        self.conv_embed = ConvPositionEmbed(
-            dim = dim,
-            kernel_size = conv_pos_embed_kernel_size,
-            groups = conv_pos_embed_groups
-        )
-
-        self.transformer = Transformer(
-            dim = dim,
-            depth = depth,
-            dim_head = dim_head,
-            heads = heads,
-            ff_mult = ff_mult,
-            ff_dropout = ff_dropout,
-            attn_dropout=attn_dropout,
-            attn_flash = attn_flash,
-            attn_qk_norm = attn_qk_norm,
-            use_gateloop_layers = use_gateloop_layers
-        )
-
-        self.to_pred = nn.Sequential(
-            nn.Linear(dim, 1),
-            Rearrange('... 1 -> ...')
-        )
-
-        # aligner related
-
-        # if we are using mel spec with 80 channels, we need to set attn_channels to 80
-        # dim_in assuming we have spec with 80 channels
-
-        self.aligner = Aligner(dim_hidden = dim_phoneme_emb, **aligner_kwargs)
-        self.align_loss = ForwardSumLoss()
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def align_phoneme_ids_with_durations(self, phoneme_ids, durations):
-        repeat_mask = generate_mask_from_repeats(durations.clamp(min = 1))
-        aligned_phoneme_ids = einsum('b i, b i j -> b j', phoneme_ids.float(), repeat_mask.float()).long()
-        return aligned_phoneme_ids
-
-    @torch.inference_mode()
-    @beartype
-    def forward_with_cond_scale(
-        self,
-        *args,
-        texts: Optional[List[str]] = None,
-        phoneme_ids = None,
-        cond_scale = 1.,
-        return_aligned_phoneme_ids = False,
-        **kwargs
-    ):
-        if exists(texts):
-            phoneme_ids = self.tokenizer.texts_to_tensor_ids(texts)
-
-        forward_kwargs = dict(
-            return_aligned_phoneme_ids = False,
-            phoneme_ids = phoneme_ids
-        )
-
-        durations = self.forward(*args, cond_drop_prob = 0., **forward_kwargs, **kwargs)
-
-        if cond_scale == 1.:
-            if not return_aligned_phoneme_ids:
-                return durations
-
-            return durations, self.align_phoneme_ids_with_durations(phoneme_ids, durations)
-
-        null_durations = self.forward(*args, cond_drop_prob = 1., **forward_kwargs, **kwargs)
-        scaled_durations = null_durations + (durations - null_durations) * cond_scale
-
-        if not return_aligned_phoneme_ids:
-            return scaled_durations
-
-        return scaled_durations, self.align_phoneme_ids_with_durations(phoneme_ids, scaled_durations)
-
-    @beartype
-    def forward_aligner(
-        self,
-        x: FloatTensor,     # (b, t, c)
-        x_mask: IntTensor,  # (b, 1, t)
-        y: FloatTensor,     # (b, t, c)
-        y_mask: IntTensor   # (b, 1, t)
-    ) -> Tuple[
-        FloatTensor,        # alignment_hard: (b, t)
-        FloatTensor,        # alignment_soft: (b, tx, ty)
-        FloatTensor,        # alignment_logprob: (b, 1, ty, tx)
-        BoolTensor          # alignment_mas: (b, tx, ty)
-    ]:
-        attn_mask = rearrange(x_mask, 'b 1 t -> b 1 t 1') * rearrange(y_mask, 'b 1 t -> b 1 1 t')
-        alignment_soft, alignment_logprob = self.aligner(rearrange(y, 'b t c -> b c t'), x, x_mask)
-
-        assert not torch.isnan(alignment_soft).any()
-
-        alignment_mas = maximum_path(
-            rearrange(alignment_soft, 'b 1 t1 t2 -> b t2 t1').contiguous(),
-            rearrange(attn_mask, 'b 1 t1 t2 -> b t1 t2').contiguous()
-        )
-
-        alignment_hard = torch.sum(alignment_mas, -1).float()
-        alignment_soft = rearrange(alignment_soft, 'b 1 t1 t2 -> b t2 t1')
-        return alignment_hard, alignment_soft, alignment_logprob, alignment_mas
-
-    @beartype
-    def forward(
-        self,
-        *,
-        cond,
-        texts: Optional[List[str]] = None,
-        phoneme_ids = None,
-        cond_drop_prob = 0.,
-        target = None,
-        cond_mask = None,
-        mel = None,
-        phoneme_len = None,
-        mel_len = None,
-        phoneme_mask = None,
-        mel_mask = None,
-        self_attn_mask = None,
-        return_aligned_phoneme_ids = False
-    ):
-        batch, seq_len, cond_dim = cond.shape
-
-        cond = self.proj_in(cond)
-
-        # text to phonemes, if tokenizer is given
-
-        if not exists(phoneme_ids):
-            assert exists(self.tokenizer)
-            phoneme_ids = self.tokenizer.texts_to_tensor_ids(texts)
-
-        # construct mask if not given
-
-        if not exists(cond_mask):
-            if coin_flip():
-                frac_lengths = torch.zeros((batch,), device = self.device).float().uniform_(*self.frac_lengths_mask)
-                cond_mask = mask_from_frac_lengths(seq_len, frac_lengths)
-            else:
-                cond_mask = prob_mask_like((batch, seq_len), self.p_drop_prob, self.device)
-
-        cond = cond * rearrange(~cond_mask, '... -> ... 1')
-
-        # classifier free guidance
-
-        if cond_drop_prob > 0.:
-            cond_drop_mask = prob_mask_like(cond.shape[:1], cond_drop_prob, cond.device)
-
-            cond = torch.where(
-                rearrange(cond_drop_mask, '... -> ... 1 1'),
-                self.null_cond,
-                cond
-            )
-
-        # phoneme id of -1 is padding
-
-        if not exists(self_attn_mask):
-            self_attn_mask = phoneme_ids != -1
-
-        phoneme_ids = phoneme_ids.clamp(min = 0)
-
-        # get phoneme embeddings
-
-        phoneme_emb = self.to_phoneme_emb(phoneme_ids)
-
-        # force condition to be same length as input phonemes
-
-        cond = curtail_or_pad(cond, phoneme_ids.shape[-1])
-
-        # combine audio, phoneme, conditioning
-
-        embed = torch.cat((phoneme_emb, cond), dim = -1)
-        x = self.to_embed(embed)
-
-        x = self.conv_embed(x, mask = self_attn_mask) + x
-
-        x = self.transformer(
-            x,
-            mask = self_attn_mask
-        )
-
-        durations = self.to_pred(x)
-
-        if not self.training:
-            if not return_aligned_phoneme_ids:
-                return durations
-
-            return durations, self.align_phoneme_ids_with_durations(phoneme_ids, durations)
-
-        # aligner
-        # use alignment_hard to oversample phonemes
-        # Duration Predictor should predict the duration of unmasked phonemes where target is masked alignment_hard
-
-        assert all([exists(el) for el in (phoneme_len, mel_len, phoneme_mask, mel_mask)]), 'need to pass phoneme_len, mel_len, phoneme_mask, mel_mask, to train duration predictor module'
-
-        alignment_hard, _, alignment_logprob, _ = self.forward_aligner(phoneme_emb, phoneme_mask, mel, mel_mask)
-        target = alignment_hard
-
-        if exists(self_attn_mask):
-            loss_mask = cond_mask & self_attn_mask
-        else:
-            loss_mask = self_attn_mask
-
-        if not exists(loss_mask):
-            return F.l1_loss(x, target)
-
-        loss = F.l1_loss(x, target, reduction = 'none')
-        loss = loss.masked_fill(~loss_mask, 0.)
-
-        # masked mean
-
-        num = reduce(loss, 'b n -> b', 'sum')
-        den = loss_mask.sum(dim = -1).clamp(min = 1e-5)
-        loss = num / den
-        loss = loss.mean()
-        
-        if not return_aligned_phoneme_ids:
-            return loss
-
-        #aligner loss
-
-        align_loss = self.align_loss(alignment_logprob, phoneme_len, mel_len)
-        loss = loss + align_loss
-
-        return loss
 
 class VoiceBox(Module):
     def __init__(
@@ -1124,15 +842,16 @@ class ConditionalFlowMatcherWrapper(Module):
     def __init__(
         self,
         voicebox: VoiceBox,
-        text_to_semantic: Optional[TextToSemantic] = None,
-        duration_predictor: Optional[DurationPredictor] = None,
+        # text_to_semantic: Optional[TextToSemantic] = None,
+        # duration_predictor: Optional[DurationPredictor] = None,
         sigma = 0.,
         ode_atol = 1e-5,
         ode_rtol = 1e-5,
         use_torchode = False,
         torchdiffeq_ode_method = 'midpoint',   # use midpoint for torchdiffeq, as in paper
         torchode_method_klass = to.Tsit5,      # use tsit5 for torchode, as torchode does not have midpoint (recommended by Bryan @b-chiang)
-        cond_drop_prob = 0.
+        cond_drop_prob = 0.,
+        wav2vec = None
     ):
         super().__init__()
         self.sigma = sigma
@@ -1140,11 +859,17 @@ class ConditionalFlowMatcherWrapper(Module):
         self.voicebox = voicebox
         self.condition_on_text = voicebox.condition_on_text
 
+        text_to_semantic = None
+        duration_predictor = None
+
         assert not (not self.condition_on_text and exists(text_to_semantic)), 'TextToSemantic should not be passed in if not conditioning on text'
         assert not (exists(text_to_semantic) and not exists(text_to_semantic.wav2vec)), 'the wav2vec module must exist on the TextToSemantic, if being used to condition on text'
 
         self.text_to_semantic = text_to_semantic
         self.duration_predictor = duration_predictor
+        self.wav2veclist = None
+        if not wav2vec is None:
+            self.wav2veclist = [wav2vec] # carwin add, save in a list, it will not be save to state_dict
 
         if self.condition_on_text and (exists(text_to_semantic) or exists(duration_predictor)):
             assert exists(text_to_semantic) ^ exists(duration_predictor), 'you should use either TextToSemantic from Spear-TTS, or DurationPredictor for the text / phoneme to audio alignment, but not both'
@@ -1388,6 +1113,15 @@ class ConditionalFlowMatcherWrapper(Module):
                     semantic_token_ids = wav2vec(wav2vec_input).clone()
 
                 cond_token_ids = semantic_token_ids
+            elif not self.wav2veclist is None:
+                wav2vec = self.wav2veclist[0]
+                with torch.no_grad():
+                    semantic_token_ids = wav2vec(raw_audio)+1 # audio all must be 24khz
+                cond_token_ids = semantic_token_ids
+                # print(semantic_token_ids)
+                # print(semantic_token_ids.shape)
+                # print(raw_audio)
+                # print(raw_audio.shape)
             else:
                 assert exists(phoneme_ids)
                 cond_token_ids = phoneme_ids
