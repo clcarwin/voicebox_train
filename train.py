@@ -25,6 +25,7 @@ class AudioDataset(Dataset):
         super().__init__()
         files = glob(f"{datasetpath}/**/*.wav", recursive=True)  + \
                 glob(f"{datasetpath}/**/*.flac", recursive=True) + \
+                glob(f"{datasetpath}/**/*.opus", recursive=True) + \
                 glob(f"{datasetpath}/**/*.mp3", recursive=True)
 
         self.files = files
@@ -73,8 +74,18 @@ if __name__ == "__main__":
     parser.add_argument("--logs", type=str, default='./logs', help="")
     parser.add_argument("--bs", type=int, default=32, help="")
     parser.add_argument("--grad_accum_every", type=int, default=1, help="")
+
+    parser.add_argument("--config", type=str, default='DIM512D12', help="DIM512D12 DIM768D24 DIM1024D12")
     args = parser.parse_args()
     print(args)
+
+    if args.config=='DIM512D12': VBdim,VBdepth=512,12
+    elif args.config=='DIM768D24': VBdim,VBdepth=768,24
+    elif args.config=='DIM1024D12': VBdim,VBdepth=1024,12
+
+    save_folder = f'{args.logs}/{args.config}-{datetime.datetime.now().strftime("%Y%m%d%H%M%S")}'
+    os.makedirs(save_folder,exist_ok=True)
+    
 
     accelerator = "cuda"
     hubert_ckpt_path = f"./checkpoints/hubert_base_ls960.pt"
@@ -90,11 +101,11 @@ if __name__ == "__main__":
 
 
     model = VoiceBox(
-        dim = 512,
-        dim_cond_emb = 512,
+        dim = VBdim,
+        dim_cond_emb = VBdim,
         audio_enc_dec = EncodecVoco(),
         num_cond_tokens = 2001,
-        depth = 12,
+        depth = VBdepth,
         dim_head = 64,
         heads = 16,
         ff_mult = 4,
@@ -138,7 +149,7 @@ if __name__ == "__main__":
         log_every = 10,
         save_results_every = 100,
         save_model_every = 1000,
-        results_folder = args.logs,
+        results_folder = save_folder,
         force_clear_prev_results = None,
         num_workers = 16,
         keep_save_count = 2
